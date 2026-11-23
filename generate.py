@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Draw the front page for Monday 23 November 2026 from news.json.
+"""Render the front page for Monday 23 November 2026 from news.json.
 
-Reads the six stories (headline, summary, tag, colour) from news.json next
-to this file and paints a newspaper front page, 1024x1024, with Pillow.
-No network, no randomness. Run from anywhere: `python3 generate.py`
-writes entry.png beside this file.
+news.json beside this file holds the six verified stories of the day.
+This script paints them as a 1024x1024 newspaper front page (entry.png)
+using Pillow only -- no network, no randomness, so two runs produce
+identical bytes.
 
-The layout is measured before it is drawn: every text block is wrapped
-first, the heights are summed, and the body type shrinks a point at a
-time until the whole page fits. Drawing then uses the same heights, so
-nothing can overlap or run off the bottom of the page.
+The page is composed before it is painted. `compose_page` turns the
+stories into a flat list of rows -- paragraphs, rules and one lead
+block -- each row already wrapped with the real fonts, so its height is
+exact. `fit_page` shrinks the body type a point at a time until the
+rows fit the height budget; only then does `Renderer` walk the rows and
+paint them. Measuring first and painting second is what guarantees no
+text overlaps and nothing runs off the bottom edge.
+
+Run from anywhere: `python3 generate.py` writes entry.png beside it.
 """
 
 import json
@@ -17,207 +22,324 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-HERE = Path(__file__).resolve().parent
-PAGE = 1024
-MARGIN = 46
-CONTENT = PAGE - 2 * MARGIN
+BASE = Path(__file__).resolve().parent
 
-PAPER = (253, 251, 245)
-INK = (18, 18, 18)
-GREY = (112, 110, 106)
-FAINT = (205, 200, 188)
+# Canvas geometry.
+CANVAS = 1024
+EDGE = 46
+SPAN = CANVAS - 2 * EDGE
+PAD_TOP = 20
+PAD_BOTTOM = 20
+HEIGHT_BUDGET = 1000  # rows plus pads must stay under this
 
-SERIF_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"
-SANS_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-SANS = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+# Palette.
+PAPER_RGB = (253, 251, 245)
+INK_RGB = (18, 18, 18)
+MUTED_RGB = (112, 110, 106)
+HAIRLINE_RGB = (205, 200, 188)
+
+TYPEFACES = {
+    "serif": "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+    "sans_bold": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "sans": "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+}
+
+BASE_SIZES = {
+    "kicker": 19,
+    "masthead": 60,
+    "date": 25,
+    "lead_head": 40,
+    "lead_sum": 24,
+    "head": 27,
+    "summary": 22,
+    "tag": 20,
+    "footer": 16,
+}
+FLOOR_SUMMARY = 16
+STORY_GAP = 26
+LEAD_INDENT = 22
+BAR_WIDTH = 6
 
 
-def load(path, size):
-    return ImageFont.truetype(path, size)
+def typeface(face, points):
+    """Load one DejaVu face at the requested point size."""
+    return ImageFont.truetype(TYPEFACES[face], points)
 
 
-def wrap_text(draw, text, font, width):
-    """Greedy word wrap; returns the lines that fit `width`."""
+def fold_lines(draw, text, face, limit):
+    """Greedy word wrap: fill each line up to `limit` pixels wide."""
+    words = text.split()
     lines = []
-    current = ""
-    for word in text.split():
-        trial = f"{current} {word}".strip()
-        if draw.textlength(trial, font=font) <= width:
-            current = trial
-        else:
-            if current:
-                lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
+    line = ""
+    for word in words:
+        joined = f"{line} {word}".strip()
+        if draw.textlength(joined, font=face) <= limit:
+            line = joined
+            continue
+        if line:
+            lines.append(line)
+        line = word
+    if line:
+        lines.append(line)
     return lines
 
 
-def line_height(font, leading):
-    ascent, descent = font.getmetrics()
-    return ascent + descent + leading
+def trim(lines, count):
+    """Keep at most `count` lines of a wrapped block."""
+    return lines[:count]
 
 
-def block_height(lines, font, leading):
-    """Height of a wrapped block: line heights minus the last leading."""
+def line_pitch(face, extra):
+    """Vertical advance of one line: font height plus extra leading."""
+    top, bottom = face.getmetrics()
+    return top + bottom + extra
+
+
+def para_height(lines, face, extra):
+    """Height of a wrapped block: line pitches minus the last leading."""
     if not lines:
         return 0
-    return len(lines) * line_height(font, leading) - leading
+    return len(lines) * line_pitch(face, extra) - extra
 
 
-def draw_lines(draw, lines, font, x, y, fill, leading):
-    """Draw wrapped lines left-aligned; return y advanced by the block."""
-    for line in lines:
-        draw.text((x, y), line, font=font, fill=fill)
-        y += line_height(font, leading)
-    return y - leading if lines else y
+def part_height(part):
+    return para_height(part["lines"], part["face"], part["extra"])
 
 
-def draw_centered(draw, lines, font, y, fill, leading):
-    """Draw wrapped lines centred; return y advanced by the block."""
-    for line in lines:
-        w = draw.textlength(line, font=font)
-        draw.text(((PAGE - w) / 2, y), line, font=font, fill=fill)
-        y += line_height(font, leading)
-    return y - leading if lines else y
+def lead_height(lead):
+    """Height of the lead block's text and internal gaps (no bar yet)."""
+    total = 0
+    for part in lead["parts"][:-1]:
+        total += part_height(part) + part["gap_after"]
+    return total + part_height(lead["parts"][-1])
 
 
-def measure(draw, data, sizes):
-    """Wrap every text block at `sizes`; return (total height, wrapped)."""
-    kicker_f = load(SANS_BOLD, sizes["kicker"])
-    mast_f = load(SERIF_BOLD, sizes["masthead"])
-    date_f = load(SANS_BOLD, sizes["date"])
-    lead_head_f = load(SERIF_BOLD, sizes["lead_head"])
-    lead_sum_f = load(SANS, sizes["lead_sum"])
-    head_f = load(SANS_BOLD, sizes["head"])
-    sum_f = load(SANS, sizes["summary"])
-    tag_f = load(SANS_BOLD, sizes["tag"])
-    foot_f = load(SANS, sizes["footer"])
+def row_height(row):
+    """Full height of a row, including the blank space after it."""
+    kind = row["kind"]
+    if kind == "para":
+        return para_height(row["lines"], row["face"], row["extra"]) + row["gap_after"]
+    if kind == "rule":
+        return row["weight"] + row["gap_after"]
+    if kind == "lead":
+        return lead_height(row) + row["gap_after"]
+    raise ValueError(f"unknown row kind: {kind}")
 
-    wrapped = {}
-    wrapped["kicker"] = wrap_text(draw, data["kicker"], kicker_f, CONTENT)
-    wrapped["masthead"] = wrap_text(draw, data["title"], mast_f, CONTENT)
-    wrapped["date"] = wrap_text(draw, data["date_line"], date_f, CONTENT)
+
+def para_row(lines, face, rgb, extra, gap_after, centred=False, indent=0):
+    return {
+        "kind": "para",
+        "lines": lines,
+        "face": face,
+        "rgb": rgb,
+        "extra": extra,
+        "gap_after": gap_after,
+        "centred": centred,
+        "indent": indent,
+    }
+
+
+def lead_part(lines, face, rgb, extra, gap_after, indent=LEAD_INDENT):
+    return {
+        "lines": lines,
+        "face": face,
+        "rgb": rgb,
+        "extra": extra,
+        "gap_after": gap_after,
+        "indent": indent,
+    }
+
+
+def compose_page(data, draw, sizes):
+    """Turn the stories into rows; return (rows, total height)."""
+    face = {
+        "kicker": typeface("sans_bold", sizes["kicker"]),
+        "masthead": typeface("serif", sizes["masthead"]),
+        "date": typeface("sans_bold", sizes["date"]),
+        "tag": typeface("sans_bold", sizes["tag"]),
+        "lead_head": typeface("serif", sizes["lead_head"]),
+        "lead_sum": typeface("sans", sizes["lead_sum"]),
+        "head": typeface("sans_bold", sizes["head"]),
+        "summary": typeface("sans", sizes["summary"]),
+        "footer": typeface("sans", sizes["footer"]),
+    }
+
+    rows = [
+        para_row(
+            fold_lines(draw, data["kicker"], face["kicker"], SPAN),
+            face["kicker"], MUTED_RGB, 4, 8, centred=True,
+        ),
+        para_row(
+            fold_lines(draw, data["title"], face["masthead"], SPAN),
+            face["masthead"], INK_RGB, 4, 5, centred=True,
+        ),
+        para_row(
+            fold_lines(draw, data["date_line"], face["date"], SPAN),
+            face["date"], INK_RGB, 4, 12, centred=True,
+        ),
+        {"kind": "rule", "weight": 3, "rgb": INK_RGB, "gap_after": 5},
+        {"kind": "rule", "weight": 1, "rgb": INK_RGB, "gap_after": 14},
+    ]
 
     lead = data["stories"][0]
-    lead_w = CONTENT - 22
-    wrapped["lead_tag"] = [lead["tag"]]
-    wrapped["lead_head"] = wrap_text(draw, lead["headline"], lead_head_f, lead_w)[:2]
-    wrapped["lead_sum"] = wrap_text(draw, lead["summary"], lead_sum_f, lead_w)[:2]
-
-    wrapped["stories"] = []
-    for story in data["stories"][1:]:
-        head = wrap_text(draw, story["headline"], head_f, CONTENT)[:2]
-        # Two summary lines when the headline took one, one when it took two.
-        max_sum = 2 if len(head) == 1 else 1
-        wrapped["stories"].append(
-            {
-                "tag": story["tag"],
-                "head": head,
-                "sum": wrap_text(draw, story["summary"], sum_f, CONTENT)[:max_sum],
-            }
-        )
-    wrapped["footer"] = wrap_text(draw, data["footer"], foot_f, CONTENT)
-
-    total = 0
-    total += 20  # top pad
-    total += block_height(wrapped["kicker"], kicker_f, 4) + 8
-    total += block_height(wrapped["masthead"], mast_f, 4) + 5
-    total += block_height(wrapped["date"], date_f, 4) + 12
-    total += 3 + 5 + 1 + 14  # thick rule, gap, thin rule, gap
-    lead_h = (
-        block_height(wrapped["lead_tag"], tag_f, 2)
-        + 5
-        + block_height(wrapped["lead_head"], lead_head_f, 6)
-        + 6
-        + block_height(wrapped["lead_sum"], lead_sum_f, 5)
+    lead_rgb = tuple(lead["color"])
+    lead_width = SPAN - LEAD_INDENT
+    rows.append(
+        {
+            "kind": "lead",
+            "rgb": lead_rgb,
+            "gap_after": 14,
+            "parts": [
+                lead_part([lead["tag"]], face["tag"], lead_rgb, 2, 5),
+                lead_part(
+                    trim(
+                        fold_lines(draw, lead["headline"], face["lead_head"],
+                                   lead_width),
+                        2,
+                    ),
+                    face["lead_head"], INK_RGB, 6, 6,
+                ),
+                lead_part(
+                    trim(
+                        fold_lines(draw, lead["summary"], face["lead_sum"],
+                                   lead_width),
+                        2,
+                    ),
+                    face["lead_sum"], INK_RGB, 5, 0,
+                ),
+            ],
+        }
     )
-    total += lead_h + 14
-    total += 1 + 12  # divider + gap
-    for item in wrapped["stories"]:
-        total += block_height([item["tag"]], tag_f, 2) + 4
-        total += block_height(item["head"], head_f, 4) + 4
-        total += block_height(item["sum"], sum_f, 4) + 26
-    total += 1 + 8  # footer divider + gap
-    total += block_height(wrapped["footer"], foot_f, 3) + 20  # bottom pad
-    return total, wrapped, lead_h
+    rows.append({"kind": "rule", "weight": 1, "rgb": HAIRLINE_RGB, "gap_after": 12})
+
+    for story in data["stories"][1:]:
+        rgb = tuple(story["color"])
+        head = trim(
+            fold_lines(draw, story["headline"], face["head"], SPAN), 2
+        )
+        # A one-line headline leaves room for two summary lines.
+        summary = trim(
+            fold_lines(draw, story["summary"], face["summary"], SPAN),
+            2 if len(head) == 1 else 1,
+        )
+        rows.append(para_row([story["tag"]], face["tag"], rgb, 2, 4))
+        rows.append(para_row(head, face["head"], INK_RGB, 4, 4))
+        rows.append(para_row(summary, face["summary"], INK_RGB, 4, STORY_GAP))
+
+    rows.append({"kind": "rule", "weight": 1, "rgb": HAIRLINE_RGB, "gap_after": 8})
+    rows.append(
+        para_row(
+            fold_lines(draw, data["footer"], face["footer"], SPAN),
+            face["footer"], MUTED_RGB, 3, 0, centred=True,
+        )
+    )
+
+    total = PAD_TOP + sum(row_height(row) for row in rows) + PAD_BOTTOM
+    return rows, total
 
 
-def main():
-    data = json.loads((HERE / "news.json").read_text())
-    img = Image.new("RGB", (PAGE, PAGE), PAPER)
-    draw = ImageDraw.Draw(img)
-
-    sizes = {
-        "kicker": 19,
-        "masthead": 60,
-        "date": 25,
-        "lead_head": 40,
-        "lead_sum": 24,
-        "head": 27,
-        "summary": 22,
-        "tag": 20,
-        "footer": 16,
-    }
-    # Shrink the body type until the page fits with room to spare.
-    while True:
-        total, wrapped, lead_h = measure(draw, data, sizes)
-        if total <= 1000 or sizes["summary"] <= 16:
-            break
+def fit_page(data, draw):
+    """Compose the page, shrinking body type until it fits the budget."""
+    sizes = dict(BASE_SIZES)
+    rows, total = compose_page(data, draw, sizes)
+    while total > HEIGHT_BUDGET and sizes["summary"] > FLOOR_SUMMARY:
         sizes["summary"] -= 1
         sizes["head"] -= 1
         sizes["lead_sum"] -= 1
+        rows, total = compose_page(data, draw, sizes)
+    if total > HEIGHT_BUDGET:
+        # Never paint an overflowing page: fail loudly instead so the
+        # bad image is noticed here, not at submission time.
+        raise SystemExit(
+            f"page still {total}px tall at minimum body size "
+            f"(budget {HEIGHT_BUDGET}); refusing to overflow"
+        )
+    return rows, total, sizes
 
-    kicker_f = load(SANS_BOLD, sizes["kicker"])
-    mast_f = load(SERIF_BOLD, sizes["masthead"])
-    date_f = load(SANS_BOLD, sizes["date"])
-    lead_head_f = load(SERIF_BOLD, sizes["lead_head"])
-    lead_sum_f = load(SANS, sizes["lead_sum"])
-    head_f = load(SANS_BOLD, sizes["head"])
-    sum_f = load(SANS, sizes["summary"])
-    tag_f = load(SANS_BOLD, sizes["tag"])
-    foot_f = load(SANS, sizes["footer"])
 
-    y = 20
-    y = draw_centered(draw, wrapped["kicker"], kicker_f, y, GREY, 4)
-    y += 8
-    y = draw_centered(draw, wrapped["masthead"], mast_f, y, INK, 4)
-    y += 5
-    y = draw_centered(draw, wrapped["date"], date_f, y, INK, 4)
-    y += 12
-    draw.rectangle([MARGIN, y, PAGE - MARGIN, y + 3], fill=INK)
-    y += 3 + 5
-    draw.rectangle([MARGIN, y, PAGE - MARGIN, y + 1], fill=INK)
-    y += 1 + 14
+class Renderer:
+    """Walks the composed rows and paints them onto the canvas."""
 
-    lead = data["stories"][0]
-    lead_top = y
-    draw.rectangle([MARGIN, lead_top, MARGIN + 6, lead_top + lead_h], fill=tuple(lead["color"]))
-    x = MARGIN + 22
-    y = draw_lines(draw, wrapped["lead_tag"], tag_f, x, y, tuple(lead["color"]), 2)
-    y += 5
-    y = draw_lines(draw, wrapped["lead_head"], lead_head_f, x, y, INK, 6)
-    y += 6
-    y = draw_lines(draw, wrapped["lead_sum"], lead_sum_f, x, y, INK, 5)
-    y = lead_top + lead_h + 14
-    draw.rectangle([MARGIN, y, PAGE - MARGIN, y + 1], fill=FAINT)
-    y += 1 + 12
+    def __init__(self, draw):
+        self.draw = draw
+        self.y = PAD_TOP
 
-    for story, item in zip(data["stories"][1:], wrapped["stories"]):
-        y = draw_lines(draw, [item["tag"]], tag_f, MARGIN, y, tuple(story["color"]), 2)
-        y += 4
-        y = draw_lines(draw, item["head"], head_f, MARGIN, y, INK, 4)
-        y += 4
-        y = draw_lines(draw, item["sum"], sum_f, MARGIN, y, INK, 4)
-        y += 26
+    def run(self, rows):
+        for row in rows:
+            if row["kind"] == "para":
+                self.paint_para(row)
+            elif row["kind"] == "rule":
+                self.paint_rule(row)
+            elif row["kind"] == "lead":
+                self.paint_lead(row)
+            else:
+                raise ValueError(f"unknown row kind: {row['kind']}")
+        return self.y
 
-    draw.rectangle([MARGIN, y, PAGE - MARGIN, y + 1], fill=FAINT)
-    y += 1 + 8
-    y = draw_centered(draw, wrapped["footer"], foot_f, y, GREY, 3)
+    def paint_lines(self, lines, face, rgb, extra, centred, indent):
+        """Paint one paragraph's lines; advance past its text only."""
+        for offset, line in enumerate(lines):
+            if centred:
+                x = (CANVAS - self.draw.textlength(line, font=face)) / 2
+            else:
+                x = EDGE + indent
+            self.draw.text(
+                (x, self.y + offset * line_pitch(face, extra)),
+                line, font=face, fill=rgb,
+            )
+        self.y += para_height(lines, face, extra)
 
-    out = HERE / "entry.png"
+    def paint_para(self, row):
+        self.paint_lines(
+            row["lines"], row["face"], row["rgb"], row["extra"],
+            row["centred"], row["indent"],
+        )
+        self.y += row["gap_after"]
+
+    def paint_rule(self, row):
+        self.draw.rectangle(
+            [EDGE, self.y, CANVAS - EDGE, self.y + row["weight"] - 1],
+            fill=row["rgb"],
+        )
+        self.y += row["weight"] + row["gap_after"]
+
+    def paint_lead(self, row):
+        body = lead_height(row)
+        self.draw.rectangle(
+            [EDGE, self.y, EDGE + BAR_WIDTH - 1, self.y + body - 1],
+            fill=row["rgb"],
+        )
+        for part in row["parts"][:-1]:
+            self.paint_lines(
+                part["lines"], part["face"], part["rgb"], part["extra"],
+                False, part["indent"],
+            )
+            self.y += part["gap_after"]
+        last = row["parts"][-1]
+        self.paint_lines(
+            last["lines"], last["face"], last["rgb"], last["extra"],
+            False, last["indent"],
+        )
+        self.y += row["gap_after"]
+
+
+def main():
+    data = json.loads((BASE / "news.json").read_text())
+    img = Image.new("RGB", (CANVAS, CANVAS), PAPER_RGB)
+    draw = ImageDraw.Draw(img)
+
+    rows, total, fitted = fit_page(data, draw)
+    renderer = Renderer(draw)
+    end_y = renderer.run(rows)
+
+    out = BASE / "entry.png"
     img.save(out)
-    print(f"wrote {out} ({out.stat().st_size} bytes); measured total={total}, content ends y={y}")
+    print(
+        f"wrote {out} ({out.stat().st_size} bytes); "
+        f"measured total={total}, content ends y={end_y}, "
+        f"body sizes head={fitted['head']} summary={fitted['summary']} "
+        f"lead_sum={fitted['lead_sum']}"
+    )
 
 
 if __name__ == "__main__":
